@@ -2,7 +2,7 @@ window.MARKET_DATA = {
  "mode": "real",
  "source": "Yahoo Finance (yfinance)",
  "as_of": "2026-08-06",
- "generated_at": "2026-08-05 20:00",
+ "generated_at": "2026-08-06 03:01",
  "msi": 79.3,
  "msi_state": "乐观",
  "msi_delta": -6.7,
@@ -446,7 +446,7 @@ window.MARKET_DATA = {
   {
    "name": "黄金",
    "sym": "GOLD",
-   "val": "4,337.2",
+   "val": "4,337.8",
    "chg": 0.0,
    "fmt": "+0.00%",
    "spark": [
@@ -462,8 +462,8 @@ window.MARKET_DATA = {
     4049.1,
     4033.7,
     4095.4,
-    4337.2,
-    4337.2
+    4337.8,
+    4337.8
    ]
   },
   {
@@ -494,9 +494,9 @@ window.MARKET_DATA = {
   {
    "name": "比特币",
    "sym": "BTC",
-   "val": "64,507",
-   "chg": 0.7,
-   "fmt": "+0.70%",
+   "val": "64,492",
+   "chg": 0.68,
+   "fmt": "+0.68%",
    "spark": [
     64098.5,
     64311.81,
@@ -511,7 +511,7 @@ window.MARKET_DATA = {
     63460.9,
     64055.95,
     64055.95,
-    64506.56
+    64491.96
    ]
   }
  ],
