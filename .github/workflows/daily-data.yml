@@ -27,6 +27,7 @@ jobs:
       - name: Fetch & compute snapshot
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}

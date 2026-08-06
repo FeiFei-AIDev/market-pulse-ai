@@ -93,7 +93,10 @@ def llm_interpret(payload):
                  "你是专业投研助手。根据市场指标JSON生成中文市场解读，严格输出JSON对象，"
                  "键为 overall(总体判断2-3句), drivers(主要驱动3条数组), risks(风险提示2条数组), "
                  "watch(关注方向3条数组), strategy(策略提示1句)。"
-                 "不提供个股买卖建议，不预测具体点位。"},
+                 "字段说明：msi=情绪指数0-100；msi_state/regime=状态标签；spx_chg=标普日涨跌%；"
+                 "breadth_adv_pct=样本股上涨占比%；vix/tnx=波动率与10Y收益率；"
+                 "top_sectors/weak_sectors=强弱势板块[名称,热度]；risk_signals=已触发风险。"
+                 "只依据给定字段，不得声称数据缺失。不提供个股买卖建议，不预测具体点位。"},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
             ]
         }).encode("utf-8")
