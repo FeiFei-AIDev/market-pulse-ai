@@ -47,7 +47,7 @@ BASKET = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AVGO",
           "JPM", "BAC", "WMT", "HD", "DIS", "NFLX", "ADBE", "CRM", "ORCL",
           "CSCO", "PEP", "KO", "JNJ", "UNH", "LLY", "XOM", "CVX", "BA",
           "CAT", "GE", "V", "MA"]
-EXTRA = ["^VIX3M", "DX-Y.NYB", "HYG", "LQD"]
+EXTRA = ["^VIX3M", "DX-Y.NYB", "HYG", "LQD", "SPY"]
 
 def clamp(v, a=0.0, b=100.0):
     return float(max(a, min(b, v)))
@@ -61,11 +61,16 @@ print("[1/4] 下载行情数据（约需 10-30 秒）…")
 syms = [s for _, _, s, _ in IDX] + [s for _, s, _ in SECTORS] + BASKET + EXTRA
 raw = yf.download(syms, period="1y", auto_adjust=True, progress=False, threads=True)
 closes = raw["Close"].ffill()
-volumes = raw["Volume"].ffill()
+volumes = raw["Volume"].replace(0, np.nan).ffill()
 
 last = closes.iloc[-1]
 prev = closes.iloc[-2]
 as_of = closes.index[-1].strftime("%Y-%m-%d")
+
+REQUIRED = [s for _, _, s, _ in IDX] + [s for _, s, _ in SECTORS] + ["^VIX3M", "DX-Y.NYB", "HYG", "LQD", "SPY"]
+miss = [s for s in REQUIRED if s not in closes.columns or closes[s].dropna().empty]
+if miss:
+    raise SystemExit("关键符号数据缺失：%s（Yahoo 可能对 CI IP 限流，稍后重试）" % ", ".join(miss))
 
 # ---------------- 指数卡片 ----------------
 print("[2/4] 计算指数与行业…")
@@ -101,14 +106,14 @@ vix3m = closes["^VIX3M"]
 tnx = closes["^TNX"]
 dxy = closes["DX-Y.NYB"]
 credit = closes["HYG"] / closes["LQD"]
-spv = volumes["^GSPC"]
+spv = volumes["SPY"] if "SPY" in volumes.columns and volumes["SPY"].notna().sum() > 100 else volumes["^GSPC"]
 
 ma20, ma50, ma200 = spx.rolling(20).mean(), spx.rolling(50).mean(), spx.rolling(200).mean()
 ma_pos = (25 * (spx > ma20) + 25 * (spx > ma50) + 25 * (ma20 > ma50) + 25 * (spx > ma200)).astype(float)
 r20 = (spx / spx.shift(20) - 1) * 100
 momentum = lin(r20, -8, 8) if False else ((r20 + 8) / 16 * 100).clip(0, 100)
 
-bk = closes[BASKET]
+bk = closes[BASKET].dropna(axis=1, how="all")
 adv_pct = (bk > bk.shift(1)).mean(axis=1) * 100
 rmax = bk.rolling(252).max()
 rmin = bk.rolling(252).min()
@@ -153,10 +158,19 @@ def state_of(v):
 def regime_label(v):
     return "过热" if v >= 85 else "乐观偏强" if v >= 70 else "震荡偏强" if v >= 50 else "谨慎震荡" if v >= 30 else "悲观防御"
 
-cur = {k: float(s.iloc[-1]) for k, s in dict(
+def lastval(s, name):
+    s = s.dropna()
+    if s.empty:
+        raise SystemExit("因子序列 %s 为空：Yahoo 数据缺失或被限流，请稍后重试" % name)
+    return float(s.iloc[-1])
+
+if len(msi) < 90:
+    raise SystemExit("有效历史不足 90 天（%d 天），数据源可能不完整" % len(msi))
+
+cur = {k: lastval(s, k) for k, s in dict(
     trend=f_trend, flow=f_flow, sent=f_sent, vol=f_vol, macro=f_macro, msi=msi).items()}
 msi_now = cur["msi"]
-msi_prev = float(msi.iloc[-2])
+msi_prev = float(msi.dropna().iloc[-2])
 regime_now = round(0.5 * cur["trend"] + 0.25 * cur["flow"] + 0.25 * cur["vol"])
 
 # 情绪历史（7/30/90）
