@@ -178,7 +178,7 @@ last = closes.iloc[-1]
 prev = closes.iloc[-2]
 as_of = closes.index[-1].strftime("%Y-%m-%d")
 
-REQUIRED = [s for _, _, s, _ in IDX] + [s for _, s, _ in SECTORS] + ["^VIX3M", "DX-Y.NYB", "HYG", "LQD", "SPY"]
+REQUIRED = ["^GSPC", "^VIX"]
 miss = [s for s in REQUIRED if s not in closes.columns or closes[s].dropna().empty]
 if miss:
     print("  补取缺失符号：%s" % ", ".join(miss))
@@ -205,6 +205,9 @@ def spark(sym, n=14):
 indices = []
 for name, sym, ysym, kind in IDX:
     v, p = float(last[ysym]), float(prev[ysym])
+    if np.isnan(v) or np.isnan(p):
+        print("  指数 %s 数据缺失，卡片跳过" % name)
+        continue
     if kind == "yield":
         chg_bp = (v - p) * 100
         indices.append(dict(name=name, sym=sym, val="%.2f%%" % v, chg=round(chg_bp, 1),
@@ -225,12 +228,23 @@ for name, sym, ysym, kind in IDX:
                             fmt="%+.2f%%" % chg, spark=spark(ysym), **extra))
 
 # ---------------- 因子序列（向量化） ----------------
+def opt(sym):
+    return sym in closes.columns and closes[sym].notna().sum() > 100
+
 spx = closes["^GSPC"]
 vix = closes["^VIX"]
-vix3m = closes["^VIX3M"]
-tnx = closes["^TNX"]
-dxy = closes["DX-Y.NYB"]
-credit = closes["HYG"] / closes["LQD"]
+HAS_VIX3M = opt("^VIX3M")
+HAS_TNX = opt("^TNX")
+HAS_DXY = opt("DX-Y.NYB")
+HAS_CRED = opt("HYG") and opt("LQD")
+vix3m = closes["^VIX3M"] if HAS_VIX3M else None
+tnx = closes["^TNX"] if HAS_TNX else None
+dxy = closes["DX-Y.NYB"] if HAS_DXY else None
+credit = closes["HYG"] / closes["LQD"] if HAS_CRED else None
+if not HAS_VIX3M: print("  ^VIX3M 缺失，期限结构取中性 60")
+if not HAS_TNX: print("  ^TNX 缺失，利率分量取中性 50")
+if not HAS_DXY: print("  美元指数缺失，美元分量取中性 50")
+if not HAS_CRED: print("  HYG/LQD 缺失，信用代理取中性 50（FRED 可用时仍以 FRED 为准）")
 spv = volumes["SPY"] if "SPY" in volumes.columns and volumes["SPY"].notna().sum() > 100 else volumes["^GSPC"]
 if spv.notna().sum() < 100:
     _h = _fetch_one("SPY", closes.index)
@@ -268,9 +282,12 @@ f_trend = 0.4 * ma_pos + 0.3 * momentum + 0.3 * nhnl
 def roll_pctile(s, w=252):
     return s.rolling(w).apply(lambda x: (x[-1] > x).mean() * 100, raw=True)
 vix_pct = roll_pctile(vix)
-term_ratio = vix3m / vix
-term_score = pd.Series(np.select([term_ratio > 1.05, term_ratio >= 0.95],
-                                 [100, 60], default=20), index=term_ratio.index)
+if HAS_VIX3M:
+    term_ratio = vix3m / vix
+    term_score = pd.Series(np.select([term_ratio > 1.05, term_ratio >= 0.95],
+                                     [100, 60], default=20), index=term_ratio.index)
+else:
+    term_score = pd.Series(60.0, index=closes.index)
 f_vol = 0.6 * (100 - vix_pct) + 0.4 * term_score
 
 vol_ratio = spv.rolling(5).mean() / spv.rolling(20).mean()
@@ -283,20 +300,29 @@ adv_score = ((adv_pct - 30) / 40 * 100).clip(0, 100)
 pc_proxy = ((30 - vix) / 18 * 100).clip(0, 100)                     # 以VIX反向代理期权情绪
 f_sent = 0.5 * adv_score + 0.5 * pc_proxy
 
-tnx_1m = (tnx - tnx.shift(21)) * 100                                # bp
-rate_score = ((40 - tnx_1m) / 80 * 100).clip(0, 100)
+if HAS_TNX:
+    tnx_1m = (tnx - tnx.shift(21)) * 100                            # bp
+    rate_score = ((40 - tnx_1m) / 80 * 100).clip(0, 100)
+else:
+    rate_score = pd.Series(50.0, index=closes.index)
 oas = fred_series("BAMLH0A0HYM2", 80)
 if oas is not None:
     oas_a = oas.reindex(closes.index, method="ffill")
     dbp_1m = (oas_a - oas_a.shift(21)) * 100                      # bp
     cred_score = (50 - dbp_1m).clip(0, 100)
     cred_src = "FRED HY OAS（真实）"
-else:
+elif HAS_CRED:
     cred_1m = (credit / credit.shift(21) - 1) * 100
     cred_score = ((cred_1m + 2) / 4 * 100).clip(0, 100)
     cred_src = "HYG/LQD 价格代理"
-dxy_1m = (dxy / dxy.shift(21) - 1) * 100
-dxy_score = ((3 - dxy_1m) / 6 * 100).clip(0, 100)
+else:
+    cred_score = pd.Series(50.0, index=closes.index)
+    cred_src = "中性（数据缺失）"
+if HAS_DXY:
+    dxy_1m = (dxy / dxy.shift(21) - 1) * 100
+    dxy_score = ((3 - dxy_1m) / 6 * 100).clip(0, 100)
+else:
+    dxy_score = pd.Series(50.0, index=closes.index)
 f_macro = 0.4 * rate_score + 0.3 * cred_score + 0.3 * dxy_score
 
 msi = (0.30 * f_trend + 0.25 * f_flow + 0.20 * f_sent + 0.15 * f_vol + 0.10 * f_macro)
@@ -326,8 +352,10 @@ p_mom = 0.5 * ((5 - r5) / 10 * 100).clip(0, 100) + 0.5 * ((10 - r20) / 20 * 100)
 
 if oas is not None:
     p_credit = ((dbp_1m + 20) / 70 * 100).clip(0, 100)           # -20bp→0, +50bp→100
-else:
+elif HAS_CRED:
     p_credit = ((cred_1m + 1) / 3 * 100).clip(0, 100)            # -1%→0, +2%→100
+else:
+    p_credit = pd.Series(50.0, index=closes.index)
 
 pressure = (0.30 * p_trend + 0.25 * p_vol + 0.20 * p_breadth
             + 0.15 * p_mom + 0.10 * p_credit).dropna()
@@ -376,6 +404,9 @@ msi_history = {"7": hist(7), "30": hist(30), "90": hist(90)}
 # ---------------- 行业热度 ----------------
 sectors = []
 for name, sym, tickers in SECTORS:
+    if not opt(sym):
+        print("  行业 %s 数据缺失，跳过" % name)
+        continue
     c1 = (float(last[sym]) / float(prev[sym]) - 1) * 100
     c5 = (float(last[sym]) / float(closes[sym].iloc[-6]) - 1) * 100
     score = int(round(clamp(50 + 6 * c1 + 2.5 * c5, 5, 98)))
@@ -439,25 +470,30 @@ else:
 if float(vol_ratio.dropna().iloc[-1]) > 1.05 and adv_now > 55:
     risks.append(dict(level="green", label="利好", tag="资金流", title="量价配合良好",
                       desc="放量上涨，两日均量为20日均量 %d%%" % round(vr_now * 100)))
-tnx_wk = float((tnx.iloc[-1] - tnx.iloc[-6]) * 100)
-if abs(tnx_wk) > 12:
-    risks.append(dict(level="yellow", label="关注", tag="宏观", title="利率快速波动",
-                      desc="10Y 美债收益率一周变动 %+.0fbp 至 %.2f%%" % (tnx_wk, float(tnx.iloc[-1]))))
-semi_top = max([s for s in sectors if s["name"] in ("半导体", "AI & 云计算")], key=lambda x: x["score"])
-if semi_top["score"] >= 88:
-    risks.append(dict(level="yellow", label="关注", tag="估值", title="AI/半导体处高位",
-                      desc="%s 热度 %d，5日 %+.1f%%，拥挤度偏高" % (semi_top["name"], semi_top["score"],
-                            (float(last["SMH"]) / float(closes["SMH"].iloc[-6]) - 1) * 100)))
-rut20 = (float(last["^RUT"]) / float(closes["^RUT"].iloc[-21]) - 1) * 100
-spx20 = (float(last["^GSPC"]) / float(closes["^GSPC"].iloc[-21]) - 1) * 100
-rel = rut20 - spx20
-if rel < -4:
-    risks.append(dict(level="red", label="预警", tag="结构", title="大小盘分化扩大",
-                      desc="罗素2000 相对标普500 的20日超额 %.1f%%，宽度集中于大盘" % rel))
-cred_wk = float((credit.iloc[-1] / credit.iloc[-6] - 1) * 100)
-if cred_wk < -1:
-    risks.append(dict(level="red", label="预警", tag="信用", title="信用利差走阔",
-                      desc="HYG/LQD 一周 %.1f%%，信用环境收紧" % cred_wk))
+if HAS_TNX:
+    tnx_wk = float((tnx.iloc[-1] - tnx.iloc[-6]) * 100)
+    if abs(tnx_wk) > 12:
+        risks.append(dict(level="yellow", label="关注", tag="宏观", title="利率快速波动",
+                          desc="10Y 美债收益率一周变动 %+.0fbp 至 %.2f%%" % (tnx_wk, float(tnx.iloc[-1]))))
+semi_cand = [s for s in sectors if s["name"] in ("半导体", "AI & 云计算")]
+if semi_cand and opt("SMH"):
+    semi_top = max(semi_cand, key=lambda x: x["score"])
+    if semi_top["score"] >= 88:
+        risks.append(dict(level="yellow", label="关注", tag="估值", title="AI/半导体处高位",
+                          desc="%s 热度 %d，5日 %+.1f%%，拥挤度偏高" % (semi_top["name"], semi_top["score"],
+                                (float(last["SMH"]) / float(closes["SMH"].iloc[-6]) - 1) * 100)))
+if opt("^RUT"):
+    rut20 = (float(last["^RUT"]) / float(closes["^RUT"].iloc[-21]) - 1) * 100
+    spx20 = (float(last["^GSPC"]) / float(closes["^GSPC"].iloc[-21]) - 1) * 100
+    rel = rut20 - spx20
+    if rel < -4:
+        risks.append(dict(level="red", label="预警", tag="结构", title="大小盘分化扩大",
+                          desc="罗素2000 相对标普500 的20日超额 %.1f%%，宽度集中于大盘" % rel))
+if HAS_CRED:
+    cred_wk = float((credit.iloc[-1] / credit.iloc[-6] - 1) * 100)
+    if cred_wk < -1:
+        risks.append(dict(level="red", label="预警", tag="信用", title="信用利差走阔",
+                          desc="HYG/LQD 一周 %.1f%%，信用环境收紧" % cred_wk))
 greens = sum(1 for r in risks if r["level"] == "green")
 yellows = sum(1 for r in risks if r["level"] == "yellow")
 reds = sum(1 for r in risks if r["level"] == "red")
@@ -473,16 +509,19 @@ else:
 # ---------------- 规则化 AI 解读 ----------------
 top_sectors = sorted(sectors, key=lambda x: -x["score"])[:2]
 bot_sectors = sorted(sectors, key=lambda x: x["score"])[:2]
-spc1 = float(indices[0]["chg"])
+spc1 = float(indices[0]["chg"]) if indices else 0.0
 drivers = []
 drivers.append("标普500 日涨跌 %+.2f%%，趋势因子得分 %d/100" % (spc1, round(cur["trend"])))
-drivers.append("%s、%s 领涨行业（热度 %d / %d）" % (top_sectors[0]["name"], top_sectors[1]["name"],
-               top_sectors[0]["score"], top_sectors[1]["score"]))
+if len(top_sectors) >= 2:
+    drivers.append("%s、%s 领涨行业（热度 %d / %d）" % (top_sectors[0]["name"], top_sectors[1]["name"],
+                   top_sectors[0]["score"], top_sectors[1]["score"]))
 drivers.append("VIX %.1f（一年 %d%% 分位），波动因子得分 %d/100" % (vix_now, int(vix_p), round(cur["vol"])))
 ai_risks = [r["title"] + "：" + r["desc"] for r in risks if r["level"] != "green"] or ["当前无显著风险信号触发"]
-watch = ["情绪指数 MSI 当前 %.0f，%s区间上沿为 85（过热警示）" % (msi_now, state_of(msi_now)),
-         "10Y 美债收益率走势（当前 %.2f%%）" % float(tnx.iloc[-1]),
-         "行业宽度能否从 %s 扩散至弱势板块（%s）" % (top_sectors[0]["name"], bot_sectors[0]["name"])]
+watch = ["情绪指数 MSI 当前 %.0f，%s区间上沿为 85（过热警示）" % (msi_now, state_of(msi_now))]
+if HAS_TNX:
+    watch.append("10Y 美债收益率走势（当前 %.2f%%）" % float(tnx.dropna().iloc[-1]))
+if len(top_sectors) >= 2 and bot_sectors:
+    watch.append("行业宽度能否从 %s 扩散至弱势板块（%s）" % (top_sectors[0]["name"], bot_sectors[0]["name"]))
 strat_map = {"悲观": "市场处于防御状态，控制仓位，关注避险资产与超跌修复。",
              "谨慎": "方向不明，降低操作频率，等待趋势确认。",
              "偏强": "趋势健康，维持正常配置，避免追高单一拥挤板块。",
@@ -498,7 +537,7 @@ _llm = llm_interpret(dict(
     date=as_of, msi=round(msi_now, 1), msi_state=state_of(msi_now),
     regime=regime_label(regime_now), spx_chg=round(spc1, 2),
     breadth_adv_pct=round(adv_now, 1), vix=round(vix_now, 1),
-    tnx=round(float(tnx.iloc[-1]), 2),
+    tnx=round(float(tnx.dropna().iloc[-1]), 2) if HAS_TNX else None,
     top_sectors=[[s["name"], s["score"]] for s in top_sectors],
     weak_sectors=[[s["name"], s["score"]] for s in bot_sectors],
     risk_signals=[r["title"] + "：" + r["desc"] for r in risks if r["level"] != "green"]))
