@@ -191,6 +191,12 @@ if miss:
 if miss:
     raise SystemExit("关键符号数据缺失：%s（Yahoo 可能对 CI IP 限流，稍后重试）" % ", ".join(miss))
 
+# 篮子成分股软补取（宽度用；仍缺失则下方中性回退）
+for s in [x for x in BASKET if x not in closes.columns or closes[x].dropna().empty]:
+    _hb = _fetch_one(s, closes.index, tries=2)
+    if _hb is not None:
+        closes[s] = _hb["Close"].reindex(closes.index).ffill()
+
 # ---------------- 指数卡片 ----------------
 print("[2/4] 计算指数与行业…")
 def spark(sym, n=14):
@@ -239,13 +245,23 @@ ma_pos = (25 * (spx > ma20) + 25 * (spx > ma50) + 25 * (ma20 > ma50) + 25 * (spx
 r20 = (spx / spx.shift(20) - 1) * 100
 momentum = lin(r20, -8, 8) if False else ((r20 + 8) / 16 * 100).clip(0, 100)
 
-bk = closes[BASKET].dropna(axis=1, how="all")
-adv_pct = (bk > bk.shift(1)).mean(axis=1) * 100
-rmax = bk.rolling(252).max()
-rmin = bk.rolling(252).min()
-nh = (bk >= rmax * 0.999).sum(axis=1)
-nl = (bk <= rmin * 1.001).sum(axis=1)
-nhnl = (nh / (nh + nl).replace(0, np.nan) * 100).fillna(50)
+bk_cols = [s for s in BASKET if s in closes.columns and closes[s].notna().sum() > 100]
+bk = closes[bk_cols]
+if len(bk_cols) >= 10:
+    adv_pct = (bk > bk.shift(1)).mean(axis=1) * 100
+    rmax = bk.rolling(252).max()
+    rmin = bk.rolling(252).min()
+    nh = (bk >= rmax * 0.999).sum(axis=1)
+    nl = (bk <= rmin * 1.001).sum(axis=1)
+    nhnl = (nh / (nh + nl).replace(0, np.nan) * 100).fillna(50)
+    up_n = int((bk.iloc[-1] > bk.iloc[-2]).sum())
+else:
+    print("  宽度样本不足（%d 只），宽度分量取中性 50" % len(bk_cols))
+    adv_pct = pd.Series(50.0, index=closes.index)
+    nh = pd.Series(0, index=closes.index)
+    nl = pd.Series(0, index=closes.index)
+    nhnl = pd.Series(50.0, index=closes.index)
+    up_n = 0
 
 f_trend = 0.4 * ma_pos + 0.3 * momentum + 0.3 * nhnl
 
@@ -379,9 +395,8 @@ for name, sym, tickers in SECTORS:
 
 # ---------------- 宽度与拆解 ----------------
 adv_now = float(adv_pct.dropna().iloc[-1])
-up_n = int((bk.iloc[-1] > bk.iloc[-2]).sum())
-dec_n = len(BASKET) - up_n
-nh_now, nl_now = int(nh.iloc[-1]), int(nl.iloc[-1])
+dec_n = len(bk_cols) - up_n
+nh_now, nl_now = int(nh.dropna().iloc[-1]), int(nl.dropna().iloc[-1])
 vr_now = float(vol_ratio.dropna().iloc[-1])
 
 breadth = dict(adv_pct=round(adv_now, 1), adv=up_n, dec=dec_n, flat=0,
