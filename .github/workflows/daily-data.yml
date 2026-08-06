@@ -25,6 +25,11 @@ jobs:
         run: pip install --quiet yfinance pandas numpy
 
       - name: Fetch & compute snapshot
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: python fetch_data.py
 
       - name: Commit snapshot

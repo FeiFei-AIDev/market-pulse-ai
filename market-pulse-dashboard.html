@@ -386,7 +386,7 @@
         <div class="ai-title">✦ AI 市场解读</div>
         <div class="ai-meta">
           <span class="chip-soft">MarketPulse-LLM</span>
-          <span class="chip-soft">模拟生成</span>
+          <span class="chip-soft" id="aiEngineChip">模拟生成</span>
           <span id="aiTime">今日 06:30 ET</span>
         </div>
       </div>
@@ -865,6 +865,7 @@ if(REAL){
   BREAKDOWN=REAL.breakdown;
   AI_VARIANTS=REAL.ai;
   document.getElementById('aiTime').textContent='生成于 '+REAL.generated_at;
+  document.getElementById('aiEngineChip').textContent=REAL.ai_engine==='llm'? 'LLM 生成' : '规则引擎';
 }
 var BREADTH=REAL? REAL.breadth : {adv_pct:63.6,adv:3216,dec:1842,flat:112,new_high:186,new_low:42,vol_ratio:112};
 

@@ -56,6 +56,65 @@ def lin(v, lo, hi):
     """线性映射 lo→0, hi→100"""
     return clamp((v - lo) / (hi - lo) * 100.0)
 
+# ---------------- 可选增强：FRED 真实宏观数据（无Key回退代理） ----------------
+def fred_series(sid, limit=60):
+    """FRED_API_KEY 存在时拉取日频序列（pandas Series），否则/失败返回 None"""
+    key = os.environ.get("FRED_API_KEY")
+    if not key:
+        return None
+    try:
+        import urllib.request
+        url = ("https://api.stlouisfed.org/fred/series/observations?series_id=%s"
+               "&api_key=%s&file_type=json&sort_order=desc&limit=%d" % (sid, key, limit))
+        with urllib.request.urlopen(url, timeout=30) as r:
+            obs = json.loads(r.read())["observations"]
+        vals = {pd.Timestamp(o["date"]): float(o["value"])
+                for o in obs if o["value"] not in (".", "")}
+        s = pd.Series(vals).sort_index()
+        return s if len(s) >= 25 else None
+    except Exception as e:
+        print("  FRED 拉取失败（%s），使用代理: %s" % (sid, e))
+        return None
+
+# ---------------- 可选增强：LLM 生成解读（无Key回退规则版） ----------------
+def llm_interpret(payload):
+    """OPENAI_API_KEY/LLM_API_KEY 存在时调用 OpenAI 兼容接口，返回解读dict或None"""
+    key = os.environ.get("OPENAI_API_KEY") or os.environ.get("LLM_API_KEY")
+    if not key:
+        return None
+    base = os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    try:
+        import urllib.request
+        body = json.dumps({
+            "model": os.environ.get("LLM_MODEL", "gpt-4o-mini"),
+            "temperature": 0.4,
+            "messages": [
+                {"role": "system", "content":
+                 "你是专业投研助手。根据市场指标JSON生成中文市场解读，严格输出JSON对象，"
+                 "键为 overall(总体判断2-3句), drivers(主要驱动3条数组), risks(风险提示2条数组), "
+                 "watch(关注方向3条数组), strategy(策略提示1句)。"
+                 "不提供个股买卖建议，不预测具体点位。"},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+            ]
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            base + "/chat/completions", data=body,
+            headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            txt = json.loads(r.read())["choices"][0]["message"]["content"]
+        txt = txt.strip()
+        if txt.startswith("```"):
+            txt = txt.strip("`")
+            if txt.startswith("json"):
+                txt = txt[4:]
+        d = json.loads(txt)
+        if all(k in d for k in ("overall", "drivers", "risks", "watch", "strategy")):
+            return d
+        return None
+    except Exception as e:
+        print("  LLM 解读失败，回退规则版: %s" % e)
+        return None
+
 # ---------------- 采集 ----------------
 print("[1/4] 下载行情数据（约需 10-30 秒）…")
 syms = [s for _, _, s, _ in IDX] + [s for _, s, _ in SECTORS] + BASKET + EXTRA
@@ -143,8 +202,16 @@ f_sent = 0.5 * adv_score + 0.5 * pc_proxy
 
 tnx_1m = (tnx - tnx.shift(21)) * 100                                # bp
 rate_score = ((40 - tnx_1m) / 80 * 100).clip(0, 100)
-cred_1m = (credit / credit.shift(21) - 1) * 100
-cred_score = ((cred_1m + 2) / 4 * 100).clip(0, 100)
+oas = fred_series("BAMLH0A0HYM2", 80)
+if oas is not None:
+    oas_a = oas.reindex(closes.index, method="ffill")
+    dbp_1m = (oas_a - oas_a.shift(21)) * 100                      # bp
+    cred_score = (50 - dbp_1m).clip(0, 100)
+    cred_src = "FRED HY OAS（真实）"
+else:
+    cred_1m = (credit / credit.shift(21) - 1) * 100
+    cred_score = ((cred_1m + 2) / 4 * 100).clip(0, 100)
+    cred_src = "HYG/LQD 价格代理"
 dxy_1m = (dxy / dxy.shift(21) - 1) * 100
 dxy_score = ((3 - dxy_1m) / 6 * 100).clip(0, 100)
 f_macro = 0.4 * rate_score + 0.3 * cred_score + 0.3 * dxy_score
@@ -301,11 +368,28 @@ ai = [dict(
             % (msi_now, state_of(msi_now), regime_label(regime_now), spc1, adv_now, vix_now),
     drivers=drivers, risks=ai_risks, watch=watch, strategy=strat_map[state_of(msi_now)])]
 
+ai_engine = "rules"
+_llm = llm_interpret(dict(
+    date=as_of, msi=round(msi_now, 1), msi_state=state_of(msi_now),
+    regime=regime_label(regime_now), spx_chg=round(spc1, 2),
+    breadth_adv_pct=round(adv_now, 1), vix=round(vix_now, 1),
+    tnx=round(float(tnx.iloc[-1]), 2),
+    top_sectors=[[s["name"], s["score"]] for s in top_sectors],
+    weak_sectors=[[s["name"], s["score"]] for s in bot_sectors],
+    risk_signals=[r["title"] + "：" + r["desc"] for r in risks if r["level"] != "green"]))
+if _llm:
+    ai = [_llm]
+    ai_engine = "llm"
+    print("  AI 解读：LLM 生成")
+else:
+    print("  AI 解读：规则引擎")
+
 # ---------------- 输出 ----------------
 print("[3/4] 生成 snapshot.js …")
 snapshot = dict(
     mode="real", source="Yahoo Finance (yfinance)", as_of=as_of,
     generated_at=dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+    ai_engine=ai_engine, sources=dict(credit=cred_src),
     msi=round(msi_now, 1), msi_state=state_of(msi_now),
     msi_delta=round(msi_now - msi_prev, 1),
     regime=dict(score=regime_now, label=regime_label(regime_now), confidence=78),
