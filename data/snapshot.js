@@ -2,7 +2,7 @@ window.MARKET_DATA = {
  "mode": "real",
  "source": "Yahoo Finance (yfinance)",
  "as_of": "2026-08-06",
- "generated_at": "2026-08-05 20:26",
+ "generated_at": "2026-08-06 03:30",
  "ai_engine": "rules",
  "sources": {
   "credit": "HYG/LQD 价格代理"
@@ -450,7 +450,7 @@ window.MARKET_DATA = {
   {
    "name": "黄金",
    "sym": "GOLD",
-   "val": "4,328.0",
+   "val": "4,326.3",
    "chg": 0.0,
    "fmt": "+0.00%",
    "spark": [
@@ -466,8 +466,8 @@ window.MARKET_DATA = {
     4049.1,
     4033.7,
     4095.4,
-    4328.0,
-    4328.0
+    4326.3,
+    4326.3
    ]
   },
   {
@@ -498,9 +498,9 @@ window.MARKET_DATA = {
   {
    "name": "比特币",
    "sym": "BTC",
-   "val": "64,469",
-   "chg": 0.64,
-   "fmt": "+0.64%",
+   "val": "64,482",
+   "chg": 0.66,
+   "fmt": "+0.66%",
    "spark": [
     64098.5,
     64311.81,
@@ -515,7 +515,7 @@ window.MARKET_DATA = {
     63460.9,
     64055.95,
     64055.95,
-    64468.66
+    64481.72
    ]
   }
  ],
