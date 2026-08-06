@@ -77,8 +77,7 @@ def fred_series(sid, limit=60):
         return None
 
 # ---------------- 可选增强：LLM 生成解读（无Key回退规则版） ----------------
-def llm_interpret(payload):
-    """OPENAI_API_KEY/LLM_API_KEY 存在时调用 OpenAI 兼容接口，返回解读dict或None"""
+def _llm_json(system, user_payload, keys):
     key = os.environ.get("OPENAI_API_KEY") or os.environ.get("LLM_API_KEY")
     if not key:
         return None
@@ -89,15 +88,8 @@ def llm_interpret(payload):
             "model": os.environ.get("LLM_MODEL", "gpt-4o-mini"),
             "temperature": 0.4,
             "messages": [
-                {"role": "system", "content":
-                 "你是专业投研助手。根据市场指标JSON生成中文市场解读，严格输出JSON对象，"
-                 "键为 overall(总体判断2-3句), drivers(主要驱动3条数组), risks(风险提示2条数组), "
-                 "watch(关注方向3条数组), strategy(策略提示1句)。"
-                 "字段说明：msi=情绪指数0-100；msi_state/regime=状态标签；spx_chg=标普日涨跌%；"
-                 "breadth_adv_pct=样本股上涨占比%；vix/tnx=波动率与10Y收益率；"
-                 "top_sectors/weak_sectors=强弱势板块[名称,热度]；risk_signals=已触发风险。"
-                 "只依据给定字段，不得声称数据缺失。不提供个股买卖建议，不预测具体点位。"},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}
             ]
         }).encode("utf-8")
         req = urllib.request.Request(
@@ -111,18 +103,75 @@ def llm_interpret(payload):
             if txt.startswith("json"):
                 txt = txt[4:]
         d = json.loads(txt)
-        if all(k in d for k in ("overall", "drivers", "risks", "watch", "strategy")):
+        if all(k in d for k in keys):
             return d
         return None
     except Exception as e:
-        print("  LLM 解读失败，回退规则版: %s" % e)
+        print("  LLM 调用失败，回退规则版: %s" % e)
         return None
 
-# ---------------- 采集 ----------------
+def llm_interpret(payload):
+    return _llm_json(
+        "你是专业投研助手。根据市场指标JSON生成中文市场解读，严格输出JSON对象，"
+        "键为 overall(总体判断2-3句), drivers(主要驱动3条数组), risks(风险提示2条数组), "
+        "watch(关注方向3条数组), strategy(策略提示1句)。"
+        "字段说明：msi=情绪指数0-100；msi_state/regime=状态标签；spx_chg=标普日涨跌%；"
+        "breadth_adv_pct=样本股上涨占比%；vix/tnx=波动率与10Y收益率；"
+        "top_sectors/weak_sectors=强弱势板块[名称,热度]；risk_signals=已触发风险。"
+        "只依据给定字段，不得声称数据缺失。不提供个股买卖建议，不预测具体点位。",
+        payload, ("overall", "drivers", "risks", "watch", "strategy"))
+
+def llm_report(payload):
+    return _llm_json(
+        "你是专业风险监测助手。根据美股压力指数JSON生成中文周报，严格输出JSON对象，键为 "
+        "summary(本期总评1-2句), commentary(周度变化分析2-3段、每段1-3句、用||分隔), "
+        "strategy(操作建议1句)。风格冷静克制、善守者先为不可胜。"
+        "只依据给定字段，不得声称数据缺失。不提供个股买卖建议，不预测具体点位。",
+        payload, ("summary", "commentary", "strategy"))
+
+# ---------------- 采集（批量 + 逐符号重试，抗间歇限流） ----------------
+import time
+
+def _align(idx, target):
+    if idx.tz is not None:
+        idx = idx.tz_convert("UTC")
+    if target.tz is None and idx.tz is not None:
+        idx = idx.tz_localize(None)
+    if target.tz is not None and idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    return idx
+
+def _fetch_one(sym, target_index, min_rows=200, tries=3):
+    for attempt in range(tries):
+        try:
+            h = yf.Ticker(sym).history(period="2y", auto_adjust=True)
+        except Exception:
+            h = None
+        if h is not None and len(h) >= min_rows:
+            h.index = _align(h.index, target_index)
+            return h
+        time.sleep(2 * (attempt + 1))
+    return None
+
 print("[1/4] 下载行情数据（约需 10-30 秒）…")
 syms = [s for _, _, s, _ in IDX] + [s for _, s, _ in SECTORS] + BASKET + EXTRA
-raw = yf.download(syms, period="1y", auto_adjust=True, progress=False, threads=True)
-closes = raw["Close"].ffill()
+raw = yf.download(syms, period="2y", auto_adjust=True, progress=False, threads=True)
+close_raw = raw["Close"]
+
+# 锚定符号 ^GSPC：批量失败时单独重试
+if "^GSPC" not in close_raw.columns or close_raw["^GSPC"].notna().sum() < 200:
+    h = _fetch_one("^GSPC", close_raw.index)
+    if h is not None:
+        close_raw["^GSPC"] = h["Close"].reindex(close_raw.index)
+        raw["Volume"]["^GSPC"] = h["Volume"].reindex(close_raw.index)
+
+# 截断尾部未生成的空行（CI 时区下 Yahoo 会返回当日空行）；
+# 保留中间日历日索引（BTC 七日交易撑起周末行，滚动分位窗口依赖它）
+last_valid = close_raw["^GSPC"].last_valid_index()
+if last_valid is not None:
+    close_raw = close_raw.loc[:last_valid]
+    raw["Volume"] = raw["Volume"].loc[:last_valid]
+closes = close_raw.ffill()
 volumes = raw["Volume"].replace(0, np.nan).ffill()
 
 last = closes.iloc[-1]
@@ -131,6 +180,14 @@ as_of = closes.index[-1].strftime("%Y-%m-%d")
 
 REQUIRED = [s for _, _, s, _ in IDX] + [s for _, s, _ in SECTORS] + ["^VIX3M", "DX-Y.NYB", "HYG", "LQD", "SPY"]
 miss = [s for s in REQUIRED if s not in closes.columns or closes[s].dropna().empty]
+if miss:
+    print("  补取缺失符号：%s" % ", ".join(miss))
+    for s in miss:
+        h = _fetch_one(s, closes.index)
+        if h is not None:
+            closes[s] = h["Close"].reindex(closes.index).ffill()
+            volumes[s] = h["Volume"].reindex(closes.index).replace(0, np.nan).ffill()
+    miss = [s for s in REQUIRED if s not in closes.columns or closes[s].dropna().empty]
 if miss:
     raise SystemExit("关键符号数据缺失：%s（Yahoo 可能对 CI IP 限流，稍后重试）" % ", ".join(miss))
 
@@ -169,6 +226,13 @@ tnx = closes["^TNX"]
 dxy = closes["DX-Y.NYB"]
 credit = closes["HYG"] / closes["LQD"]
 spv = volumes["SPY"] if "SPY" in volumes.columns and volumes["SPY"].notna().sum() > 100 else volumes["^GSPC"]
+if spv.notna().sum() < 100:
+    _h = _fetch_one("SPY", closes.index)
+    if _h is not None:
+        volumes["SPY"] = _h["Volume"].reindex(closes.index).replace(0, np.nan).ffill()
+        spv = volumes["SPY"]
+if spv.notna().sum() < 100:
+    spv = pd.Series(1.0, index=closes.index)                      # 量能缺失→热度中性
 
 ma20, ma50, ma200 = spx.rolling(20).mean(), spx.rolling(50).mean(), spx.rolling(200).mean()
 ma_pos = (25 * (spx > ma20) + 25 * (spx > ma50) + 25 * (ma20 > ma50) + 25 * (spx > ma200)).astype(float)
@@ -222,6 +286,49 @@ f_macro = 0.4 * rate_score + 0.3 * cred_score + 0.3 * dxy_score
 msi = (0.30 * f_trend + 0.25 * f_flow + 0.20 * f_sent + 0.15 * f_vol + 0.10 * f_macro)
 msi = msi.dropna()
 
+# ---------------- 压力指数（标普500基准 · 六档风险 L1-L6） ----------------
+LV_NAMES = {1: "极低", 2: "偏低", 3: "中性", 4: "警戒", 5: "偏高", 6: "极高"}
+LV_BANDS = [(15, 1), (30, 2), (45, 3), (60, 4), (75, 5), (101, 6)]
+
+def level_of(p):
+    for hi, lv in LV_BANDS:
+        if p < hi:
+            return lv
+    return 6
+
+spx_dd = (spx / spx.rolling(252).max() - 1) * 100                 # 距一年高点回撤%
+dd_score = ((-spx_dd) / 20 * 100).clip(0, 100)                   # 回撤20%→100
+below_ma = ((spx < ma20).astype(float) + (spx < ma50) + (spx < ma200))
+p_trend = 0.6 * dd_score + 0.4 * (below_ma / 3 * 100)
+
+p_vol = 0.7 * vix_pct + 0.3 * ((1.05 - term_ratio) / 0.15 * 100).clip(0, 100)
+
+nl_share = (nl / (nh + nl).replace(0, np.nan) * 100).fillna(50)
+p_breadth = 0.5 * (100 - adv_pct.clip(0, 100)) + 0.5 * nl_share
+
+p_mom = 0.5 * ((5 - r5) / 10 * 100).clip(0, 100) + 0.5 * ((10 - r20) / 20 * 100).clip(0, 100)
+
+if oas is not None:
+    p_credit = ((dbp_1m + 20) / 70 * 100).clip(0, 100)           # -20bp→0, +50bp→100
+else:
+    p_credit = ((cred_1m + 1) / 3 * 100).clip(0, 100)            # -1%→0, +2%→100
+
+pressure = (0.30 * p_trend + 0.25 * p_vol + 0.20 * p_breadth
+            + 0.15 * p_mom + 0.10 * p_credit).dropna()
+
+weekly_p = pressure.resample("W-FRI").last().dropna()
+p_now = float(pressure.iloc[-1])
+p_week_ago = float(pressure.iloc[-6]) if len(pressure) > 6 else p_now
+lv_now = level_of(p_now)
+dur = 0
+for v in reversed(weekly_p.values):
+    if level_of(float(v)) == lv_now:
+        dur += 1
+    else:
+        break
+weeks_hist = [dict(w=d.strftime("%-m/%-d"), p=round(float(v), 1), lv=level_of(float(v)))
+              for d, v in weekly_p.tail(26).items()]
+
 def state_of(v):
     return "过热" if v >= 85 else "乐观" if v >= 70 else "偏强" if v >= 50 else "谨慎" if v >= 30 else "悲观"
 
@@ -271,25 +378,25 @@ for name, sym, tickers in SECTORS:
                         news=heat, sent=sent, view=view, tickers=tickers))
 
 # ---------------- 宽度与拆解 ----------------
-adv_now = float(adv_pct.iloc[-1])
+adv_now = float(adv_pct.dropna().iloc[-1])
 up_n = int((bk.iloc[-1] > bk.iloc[-2]).sum())
 dec_n = len(BASKET) - up_n
 nh_now, nl_now = int(nh.iloc[-1]), int(nl.iloc[-1])
-vr_now = float(vol_ratio.iloc[-1])
+vr_now = float(vol_ratio.dropna().iloc[-1])
 
 breadth = dict(adv_pct=round(adv_now, 1), adv=up_n, dec=dec_n, flat=0,
                new_high=nh_now, new_low=nl_now, vol_ratio=round(vr_now * 100),
                scope_note="大盘股样本（30只）估算")
 
 breakdown = [
-    dict(name="涨跌情绪", score=int(round(float(adv_score.iloc[-1]))),
+    dict(name="涨跌情绪", score=int(round(float(adv_score.dropna().iloc[-1]))),
          desc="%.1f%% 样本股上涨，宽度%s" % (adv_now, "健康" if adv_now > 55 else "一般" if adv_now > 45 else "偏弱"),
          color="#0ea5a4"),
-    dict(name="成交热度", score=int(round(float(vol_heat.iloc[-1]))),
+    dict(name="成交热度", score=int(round(float(vol_heat.dropna().iloc[-1]))),
          desc="两日均量为20日均量的 %d%%" % round(vr_now * 100), color="#f59e0b"),
-    dict(name="资金强度", score=int(round(float(flow_proxy.iloc[-1]))),
+    dict(name="资金强度", score=int(round(float(flow_proxy.dropna().iloc[-1]))),
          desc="量价代理估算 · 5日涨幅 %+.1f%%" % float(r5.iloc[-1]), color="#4361ee", est=True),
-    dict(name="波动舒适度", score=int(round(float(f_vol.iloc[-1]))),
+    dict(name="波动舒适度", score=int(round(float(f_vol.dropna().iloc[-1]))),
          desc="VIX %.1f，处一年 %d%% 分位" % (float(vix.iloc[-1]), int(float(vix_pct.iloc[-1]))),
          color="#8b5cf6"),
 ]
@@ -304,7 +411,7 @@ factors = [
 
 # ---------------- 风险雷达（规则引擎） ----------------
 risks = []
-vix_now, vix_p = float(vix.iloc[-1]), float(vix_pct.iloc[-1])
+vix_now, vix_p = float(vix.dropna().iloc[-1]), float(vix_pct.dropna().iloc[-1])
 if vix_p < 35:
     risks.append(dict(level="green", label="利好", tag="波动率", title="波动率处于低位",
                       desc="VIX %.1f，处一年 %d%% 分位，市场定价平静" % (vix_now, int(vix_p))))
@@ -314,7 +421,7 @@ elif vix_p > 85:
 else:
     risks.append(dict(level="yellow", label="关注", tag="波动率", title="波动率中性",
                       desc="VIX %.1f，处一年 %d%% 分位" % (vix_now, int(vix_p))))
-if float(vol_ratio.iloc[-1]) > 1.05 and adv_now > 55:
+if float(vol_ratio.dropna().iloc[-1]) > 1.05 and adv_now > 55:
     risks.append(dict(level="green", label="利好", tag="资金流", title="量价配合良好",
                       desc="放量上涨，两日均量为20日均量 %d%%" % round(vr_now * 100)))
 tnx_wk = float((tnx.iloc[-1] - tnx.iloc[-6]) * 100)
@@ -387,6 +494,57 @@ if _llm:
 else:
     print("  AI 解读：规则引擎")
 
+# ---------------- 周度风险报告（六档压力） ----------------
+c_trend = lastval(p_trend, "p_trend")
+c_volp = lastval(p_vol, "p_vol")
+c_breadth = lastval(p_breadth, "p_breadth")
+c_momp = lastval(p_mom, "p_mom")
+c_credit = lastval(p_credit, "p_credit")
+wow = p_now - p_week_ago
+bench = float(r5.iloc[-1])
+dd_now = float(spx_dd.iloc[-1])
+wow_dir = "回升" if wow > 1.5 else "回落" if wow < -1.5 else "持平"
+ADVICE = {1: "风险偏好正常，保持标准配置。", 2: "压力偏低，保持标准配置并跟踪趋势。",
+          3: "维持中性仓位，等待方向确认。", 4: "维持「警戒」，适度降低高波动敞口。",
+          5: "转向防御姿态，提高现金与对冲比例。", 6: "极端压力期，本金安全优先。"}
+LV_SUB = {1: "压力指数偏低", 2: "压力指数偏低", 3: "压力指数中性",
+          4: "压力指数偏高", 5: "压力指数高位", 6: "压力指数高位"}
+
+rep_summary = ("本期压力指数 %.0f，风险档位 %s（L%d）；较上期%s %.1f，标普500 本周 %+.1f%%。"
+               % (p_now, LV_NAMES[lv_now], lv_now, wow_dir, abs(wow), bench))
+rep_commentary = ("压力指数较上期%s，距一年高点回撤 %.1f%%，VIX 处一年 %d%% 分位。"
+                  % (wow_dir, dd_now, int(float(vix_pct.dropna().iloc[-1])))) \
+    + "||" + ("样本宽度 %.0f%% 上涨，周度动能分量 %.0f；%s。"
+              % (adv_now, c_momp, "上涨动能趋于均衡" if 40 <= adv_now <= 65 else
+                 ("动能偏强" if adv_now > 65 else "动能偏弱"))) \
+    + "||" + ("信用分量 %.0f（%s），利率与信用环境%s。"
+              % (c_credit, cred_src, "平稳" if c_credit < 55 else "边际收紧"))
+rep_strategy = ADVICE[lv_now]
+
+report = dict(
+    pressure=round(p_now, 1), level=lv_now, level_name=LV_NAMES[lv_now],
+    level_sub=LV_SUB[lv_now], wow=round(wow, 1), wow_dir=wow_dir,
+    duration=dur, advice=ADVICE[lv_now], benchmark=round(bench, 2),
+    drawdown=round(dd_now, 1),
+    components=dict(trend=round(c_trend), vol=round(c_volp), breadth=round(c_breadth),
+                    mom=round(c_momp), credit=round(c_credit)),
+    weeks=weeks_hist,
+    summary=rep_summary, commentary=rep_commentary, strategy=rep_strategy,
+    engine="rules")
+
+_llmrep = llm_report(dict(
+    date=as_of, pressure=round(p_now, 1), level="L%d %s" % (lv_now, LV_NAMES[lv_now]),
+    wow=round(wow, 1), duration_weeks=dur, benchmark_spx=round(bench, 2),
+    drawdown_from_1y_high=round(dd_now, 1),
+    components=report["components"],
+    recent_weeks=[[w["w"], w["p"], "L%d" % w["lv"]] for w in weeks_hist[-8:]]))
+if _llmrep:
+    report["summary"] = _llmrep["summary"]
+    report["commentary"] = _llmrep["commentary"]
+    report["strategy"] = _llmrep["strategy"]
+    report["engine"] = "llm"
+    print("  周报简评：LLM 生成")
+
 # ---------------- 输出 ----------------
 print("[3/4] 生成 snapshot.js …")
 snapshot = dict(
@@ -399,12 +557,13 @@ snapshot = dict(
     risk=dict(level=overall, greens=greens, yellows=yellows, reds=reds),
     factors=factors, msi_history=msi_history, indices=indices,
     breadth=breadth, breakdown=breakdown, sectors=sectors, risks=risks, ai=ai,
+    report=report,
 )
 os.makedirs(OUT_DIR, exist_ok=True)
 with open(os.path.join(OUT_DIR, "snapshot.js"), "w", encoding="utf-8") as f:
     f.write("window.MARKET_DATA = " + json.dumps(snapshot, ensure_ascii=False, indent=1) + ";\n")
 
 print("[4/4] 完成 ✔")
-print("  数据截至：%s ｜ MSI %.1f（%s）｜ 状态指数 %d（%s）｜ 风险 %s"
-      % (as_of, msi_now, state_of(msi_now), regime_now, regime_label(regime_now), overall))
+print("  数据截至：%s ｜ 压力 %.0f（L%d %s）｜ MSI %.1f（%s）｜ 风险 %s"
+      % (as_of, p_now, lv_now, LV_NAMES[lv_now], msi_now, state_of(msi_now), overall))
 print("  输出：data/snapshot.js")
