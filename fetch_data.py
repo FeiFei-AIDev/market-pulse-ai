@@ -343,7 +343,7 @@ dd_score = ((-spx_dd) / 20 * 100).clip(0, 100)                   # 回撤20%→1
 below_ma = ((spx < ma20).astype(float) + (spx < ma50) + (spx < ma200))
 p_trend = 0.6 * dd_score + 0.4 * (below_ma / 3 * 100)
 
-p_vol = 0.7 * vix_pct + 0.3 * ((1.05 - term_ratio) / 0.15 * 100).clip(0, 100)
+p_vol = 0.7 * vix_pct + 0.3 * term_score
 
 nl_share = (nl / (nh + nl).replace(0, np.nan) * 100).fillna(50)
 p_breadth = 0.5 * (100 - adv_pct.clip(0, 100)) + 0.5 * nl_share
